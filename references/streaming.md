@@ -2,8 +2,9 @@
 
 `wss://magicmarkets.com/v2/stream?api_key=<key>[&lang=en]`
 
-A separate service from the REST API. This is where **event discovery, live
-offers, private betslip quotes, and order/bet updates** all arrive.
+A separate service from the REST API. This is where **live offers, private
+betslip quotes, and order/bet updates** arrive. Events are listed here too,
+and also over REST at `GET /v2/events/` (see [`rest.md`](rest.md#market-data)).
 
 > Canonical source: `https://magicmarkets.com/llms-full.txt` (Streaming API
 > section). Fetch it when you need detail beyond this file.
@@ -14,20 +15,26 @@ offers, private betslip quotes, and order/bet updates** all arrive.
 
 | Param | Required | Notes |
 |-------|----------|-------|
-| `api_key` | yes | Same value as the `X-Api-Key` header |
+| `api_key` | yes | Same value as the `X-Api-Key` header. URL-encode it |
 | `lang` | no | `en` (default), `ko`, `zh-hans` |
 
-**Auth is enforced at the HTTP handshake.** A missing or invalid key fails the
-upgrade with a non-101 response, and the `websockets` library raises
-`InvalidStatus`. An invalid key takes slightly longer to reject than a missing
-one. **Verify the key against a REST endpoint before opening the socket** so
-an auth problem reads as `401 auth_error` rather than an opaque socket error.
+**Auth and admission are enforced at the HTTP handshake.** A refused upgrade
+returns a non-101 status with a short `text/plain` body naming the reason:
+
+| Status | Body | What to do |
+|--------|------|------------|
+| 400 | `missing_credentials`, `invalid_lang` | `api_key` is missing, or `lang` is not allowed. Fix the request |
+| 401 | `auth_rejected` | The key was not accepted. Do not retry with the same key |
+| 503 | `unavailable` | The server cannot accept connections now. Retry with backoff |
+
+Treat any other 4xx as 401 and any other 5xx as 503. The `websockets`
+library raises `InvalidStatus`, with the body on `exc.response.body`.
+**Verify the key against a REST endpoint before opening the socket** so an
+auth problem reads as `401 auth_error`.
 
 **The server does not restrict the `Origin` header.** Browser-based clients
 can connect directly with the `api_key` query parameter, including pages
 opened from `file://`. No server-side proxy is required.
-
-The retired `/magic-cpricefeed/v2` endpoint returns 502. Do not use it.
 
 ---
 
@@ -83,8 +90,12 @@ correlating with REST errors or contacting support.
 ```
 
 **This snapshot is not the full fixture list**: only events that currently
-have live prices. It may span several envelopes; `sync` is the last `data[]`
-entry of the final one.
+have live prices, the same set as `GET /v2/events/`. That can be a few
+thousand events across all sports. It may span several envelopes; `sync` is
+the last `data[]` entry of the final one.
+
+Check `start_time` as well as `ir_status`: an event can still show
+`pre_event` after its start time.
 
 Two shapes, dispatch on `event_type`:
 
@@ -119,8 +130,9 @@ re-broadcast, and any bet type that has lost all liquidity arrives as
 `["remove_offer", …]`.
 
 Registering an event with no prices is **not** an error: you get an empty
-snapshot, and offers start flowing if it becomes priced. Prefer event ids you
-saw in the sync stream.
+snapshot, and offers start flowing if it becomes priced. The stream does not
+check the form of `event_id` either: a mistyped id is acknowledged and stays
+silent. Use event ids you saw in the sync or in `GET /v2/events/`.
 
 ### `unregister_event`
 
@@ -213,7 +225,7 @@ Delivered as siblings of market data inside the same envelope.
 
 ```json
 {"ts": …, "data": [
-  ["balance", {"balance": ["USDT", 10000.1], "open_stake": ["USDT", 152.55]}],
+  ["balance", {"balance": ["USDT", 10000.1], "open_stake": ["USDT", 152.55], "smart_credit": ["USDT", 300.0]}],
   ["xrate",   {"ccy": "EUR", "rate": 1.1347}],
   ["order",   {…}], ["bet", {…}], ["pmm", {…}], ["betslip", {…}], ["info", {…}]
 ]}
@@ -221,7 +233,7 @@ Delivered as siblings of market data inside the same envelope.
 
 | Tag | Meaning | Currency |
 |---|---|---|
-| `balance` | `balance`, `open_stake` | Account's native currency |
+| `balance` | `balance`, `open_stake`, `smart_credit` (absent when none) | Account's native currency |
 | `xrate` | Exchange rate update | - |
 | `order` | `want_stake`, `stake`, `profit_loss`; nested `bets[]` | USDT |
 | `bet` | `want_stake`, `got_stake`, `profit_loss` | USDT |
@@ -278,15 +290,20 @@ when the feed recovers. Failing to clear leaves you trading on stale prices.
 There is **no** "unknown event" error. Treat any other code as **opaque**:
 log it and retry after a short backoff.
 
-### Silent drops
+### Dropped connections
 
-Three classes of failure drop an *established* connection with a raw TCP
-close: no WebSocket close frame, no in-band error:
+**Backpressure.** If you read too slowly, the server's outbound buffer
+overflows and the server closes with code **1008**. Read faster or register
+fewer events: an immediate reconnect overflows again. A client that stopped
+reading never receives the close frame and sees only the raw TCP close. If
+you do heavy work per message, hand frames to a queue and process them off
+the read loop.
 
-1. **Backpressure**: you are reading too slowly and the server's outbound
-   buffer overflows. Reconnect and resume.
-2. **I/O error**: any read/write failure on the socket.
-3. **Internal error**: rare, server-side, not client-triggerable, and
+Two classes of failure drop an *established* connection silently, with a
+raw TCP close: no WebSocket close frame, no in-band error:
+
+1. **I/O error**: any read/write failure on the socket.
+2. **Internal error**: rare, server-side, not client-triggerable, and
    observably identical to an I/O error.
 
 Always reconnect with backoff and **re-register your events**: registrations

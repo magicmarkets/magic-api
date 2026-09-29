@@ -1,40 +1,39 @@
 #!/usr/bin/env python3
 """
-02 — Maintain a live price book from the stream.
+02: Maintain a live price book from the stream.
 
 Demonstrates the three rules that separate a correct book from a subtly
 wrong one:
 
   * "offer" is a FULL REPLACEMENT for its (sport, event_id, bet_type) triple,
     not a delta. Overwrite, never merge.
-  * "remove_offer" means that bet type has no liquidity left. Delete it —
+  * "remove_offer" means that bet type has no liquidity left. Delete it:
     do not leave last-known prices in the book.
   * "clear_events" means the server lost its upstream feed. Drop everything
     and wait for the fresh snapshot.
 
+It watches the next match that has not started, not an outright.
+
 Usage:
     export MAGIC_API_KEY=...
-    python examples/02-price-book.py            # first priced event
-    python examples/02-price-book.py fb         # first priced football event
+    python 02-price-book.py            # next priced match, any sport
+    python 02-price-book.py fb         # next priced football match
 """
 
 import sys
 
-from _common import best, frames, label, open_stream, register, sync_events, verify_key
+from _common import best, frames, label, open_stream, pick_match, register, run_cli, sync_events, verify_key
 
 
 def main(sport_filter):
     verify_key()
 
     with open_stream() as ws:
-        events = sync_events(ws)
-        if sport_filter:
-            events = [e for e in events if e.get("sport") == sport_filter]
-        if not events:
-            sys.exit("No priced events matched.")
+        ev = pick_match(sync_events(ws), sport_filter)
+        if not ev:
+            sys.exit("No priced match found.")
 
-        ev = events[0]
-        print(f"watching {ev['sport']} {ev['event_id']} — {label(ev)}\n")
+        print(f"watching {ev['sport']} {ev['event_id']}: {label(ev)}\n")
         register(ws, ev["sport"], ev["event_id"])
 
         book = {}
@@ -44,7 +43,7 @@ def main(sport_filter):
             elif tag == "remove_offer":
                 book.pop((p["sport"], p["event_id"], p["bet_type"]), None)
             elif tag == "clear_events":
-                print("!! upstream feed lost — clearing book")
+                print("!! upstream feed lost: clearing book")
                 book.clear()
                 continue
             elif tag == "response" and p and p.get("status") == "error":
@@ -52,13 +51,14 @@ def main(sport_filter):
             else:
                 continue
 
-            render(book)
+            render(label(ev), book)
 
-    print("stream closed — reconnect and re-register (registrations do not persist)")
+    print("stream closed: reconnect and re-register (registrations do not persist)")
 
 
-def render(book):
+def render(title, book):
     print("\033[2J\033[H", end="")  # clear screen
+    print(title)
     print(f"{'bet_type':<28} {'best':>8} {'min':>10} {'max':>12}   depth")
     print("-" * 74)
     for (_sport, _eid, bet_type), price_list in sorted(book.items()):
@@ -71,4 +71,4 @@ def render(book):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    run_cli(main, sys.argv[1] if len(sys.argv) > 1 else None)

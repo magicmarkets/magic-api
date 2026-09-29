@@ -11,15 +11,39 @@ for schemas see [`rest.md`](rest.md) and [`streaming.md`](streaming.md).
 
 ## A: See what is tradeable right now
 
-There is no REST endpoint listing events. The stream's initial sync **is** the
-discovery mechanism: connect, collect `["event", …]` entries until
-`["sync", …]`, then disconnect if that is all you need.
+`GET /v2/events/` lists every event that currently has prices. It pages
+with `limit` and `after`:
+
+```python
+import os, requests
+
+API, H = "https://magicmarkets.com/v2", {"X-Api-Key": os.environ["MAGIC_API_KEY"]}
+
+events, after = [], None
+while True:
+    params = {"sport": "fb", "limit": 500, **({"after": after} if after else {})}
+    page = requests.get(f"{API}/events/", headers=H, params=params, timeout=30).json()["data"]
+    events += page
+    if len(page) < 500:
+        break
+    after = f"{page[-1]['sport']},{page[-1]['event_id']}"
+
+for e in sorted(events, key=lambda e: e["start_time"]):
+    label = e.get("event_name") or f"{e.get('home')} v {e.get('away')}"
+    print(f"{e['start_time']}  {e['sport']:<8} {label}")
+```
+
+The stream's initial sync gives the same set. Use it when you keep the socket
+open anyway: connect, collect `["event", ...]` entries until `["sync", ...]`,
+and changes then arrive as they happen.
 
 ```python
 import json, os
+from urllib.parse import quote
 from websockets.sync.client import connect
 
-with connect(f"wss://magicmarkets.com/v2/stream?api_key={os.environ['MAGIC_API_KEY']}") as ws:
+key = quote(os.environ["MAGIC_API_KEY"], safe="")
+with connect(f"wss://magicmarkets.com/v2/stream?api_key={key}", max_size=None) as ws:
     events, synced = [], False
     while not synced:
         for entry in json.loads(ws.recv())["data"]:
@@ -27,14 +51,13 @@ with connect(f"wss://magicmarkets.com/v2/stream?api_key={os.environ['MAGIC_API_K
                 events.append(entry[1])
             elif entry[0] == "sync":
                 synced = True
-
-for e in sorted(events, key=lambda e: e["start_time"]):
-    label = e.get("event_name") or f"{e.get('home')} v {e.get('away')}"
-    print(f"{e['start_time']}  {e['sport']:<8} {label}")
 ```
 
-This returns only events **with live prices**: far fewer than the full
-fixture list. Expect single or low double digits outside peak hours.
+Both return only events **with live prices**, not the full fixture list. That
+can still be a few thousand events, many of them outrights
+(`event_type: "multirunner"`) and period-scoped codes such as `fb_ht`. To
+find a match, filter on `event_type == "normal"` and on a `start_time` in the
+future: an event can still show `pre_event` after its start time.
 
 ---
 
@@ -46,7 +69,8 @@ verify key → connect stream → sync → register_event → pick offer
 ```
 
 1. `GET /v2/balance/`: fail fast on a bad key.
-2. Connect the stream; collect events until `sync`.
+2. Connect the stream; collect events until `sync`. Pick a `normal` event
+   whose `start_time` is in the future.
 3. `["register_event", sport, event_id]`; collect `["offer", …]` until the ok
    `["response", …]`.
 4. Pick an offer with a non-empty `price_list`. Its `sport`, `event_id` and
@@ -72,7 +96,7 @@ HB=$(curl -s -X POST "$API/heartbeats/" -H "$H" -H 'Content-Type: application/js
 
 # 2. betslip. Note: no prices in this response
 BS=$(curl -s -X POST "$API/betslips/" -H "$H" -H 'Content-Type: application/json' \
-  -d '{"sport":"fb","event_id":"2026-06-15,1001,2002","bet_type":"for,ah,h,1","betslip_type":"normal"}' \
+  -d '{"sport":"fb","event_id":"2026-06-15,1001,2002","bet_type":"for,ah,h,-4","betslip_type":"normal"}' \
   | jq -r .data.betslip_id)
 
 # 3. poll for the quote (or read pmm off the stream)
@@ -157,9 +181,15 @@ a timeout-then-retry can double-place.
 API=https://magicmarkets.com/v2
 H="X-Api-Key: $MAGIC_API_KEY"
 
-# always look before closing
-curl -s "$API/orders/" -H "$H" | jq '[.data[] | select(.closed == false)
-      | {order_id, sport, bet_type, want_price, want_stake}]'
+# always look before closing. The list is paged (25 by default): read every page
+PAGE=1
+while :; do
+  ROWS=$(curl -s "$API/orders/?page=$PAGE&page_size=100" -H "$H")
+  echo "$ROWS" | jq '[.data[] | select(.closed == false)
+        | {order_id, sport, bet_type, want_price, want_stake}]'
+  [ "$(echo "$ROWS" | jq '.data | length')" -lt 100 ] && break
+  PAGE=$((PAGE + 1))
+done
 
 # one order
 curl -s -X POST "$API/orders/12345/close/" -H "$H"
@@ -172,8 +202,8 @@ curl -s -X POST "$API/orders/close_many/" -H "$H" -H 'Content-Type: application/
 curl -s -X POST "$API/orders/close_all/" -H "$H"
 ```
 
-`close_all` takes no filter. Enumerate and close explicitly unless you really
-do mean every open order. Closing an already-closed order returns
+A page past the last one is empty. `close_all` takes no filter. Enumerate and close
+explicitly unless you really do mean every open order. Closing an already-closed order returns
 `400 order_closed`, distinct from `404 not_found`.
 
 ---
@@ -191,9 +221,34 @@ for ev in events[:20]:
   Exceeding it returns `customer_event_limit_exceeded`: unregister first.
 - `["list_registered_events"]` returns the current set.
 - Registrations **do not survive a reconnect**. Re-register after any drop.
-- Read fast. Backpressure closes the connection silently with a raw TCP close:
-  no close frame, no error. If you do heavy work per message, hand frames to
-  a queue and process them off the read loop.
+- Read fast. A slow reader is closed with code 1008, and an immediate
+  reconnect overflows again. If you do heavy work per message, hand frames
+  to a queue and process them off the read loop.
+
+---
+
+## G: Price snapshot over REST
+
+For a report or a check, read prices without a socket: list the events,
+then ask `GET /v2/offers/` for up to 20 of them in each call.
+
+```python
+ids = [e["event_id"] for e in matches]           # one sport, from recipe A
+offers = []
+for i in range(0, len(ids), 20):                 # 20 events per call
+    r = requests.get(f"{API}/offers/", headers=H, timeout=30, params={
+        "sport": "fb", "event_id": ids[i:i + 20],
+        "market_type": ["wdw", "ah", "ou"], "min_liquidity": 10,
+    })
+    offers += r.json()["data"]                   # page with `after` past 500 rows
+```
+
+- A call that names 20 events costs the same as one that names 1, and an
+  account can have only 4 calls open at once. Batch; do not fan out.
+- The reply can be about 4 seconds behind. Quote and trade from the stream.
+- Each `bet_type` goes into `POST /v2/betslips/` unchanged.
+
+Runnable version: [`../examples/05-rest-offers.py`](../examples/05-rest-offers.py).
 
 ---
 
@@ -232,6 +287,7 @@ reconnect trigger.
 ### Auth failures
 
 Verify with `GET /v2/balance/` before connecting. WebSocket auth fails at the
-handshake with a non-101 response, which client libraries surface as an opaque
-error (`websockets` raises `InvalidStatus`): much harder to diagnose than a
-`401 auth_error` from REST.
+handshake with a non-101 status and a short text body (`401 auth_rejected`,
+`400 missing_credentials`). `websockets` raises `InvalidStatus` with the body
+on `exc.response.body`. A `401 auth_error` from REST is easier to read. Its
+detail text is the same for a missing key and a wrong key, so check both.

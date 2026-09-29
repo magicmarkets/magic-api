@@ -1,0 +1,6 @@
+# Development and CI dependencies. Install with: pip install -r requirements-dev.txt
+# ruff is pinned so lint results do not drift.
+-r examples/requirements.txt
+pytest>=8.4,<10
+pytest-timeout>=2.3,<3
+ruff==0.16.9

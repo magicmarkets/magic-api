@@ -1,59 +1,72 @@
 # MagicMarkets API: Claude Skill
 
-A drop-in Claude skill for the **MagicMarkets** P2P sports markets exchange:
-**zero fees, zero commission**, USDT-denominated, REST + WebSocket. Built so
-an LLM can write a working trading bot against the API the first time you ask.
+[![CI](https://github.com/magicmarkets/magic-api/actions/workflows/ci.yml/badge.svg)](https://github.com/magicmarkets/magic-api/actions/workflows/ci.yml)
+
+A drop-in Claude skill for the **MagicMarkets** sports markets exchange:
+**zero fees**, USDT-denominated, REST + WebSocket. Built so an LLM can
+write a working trading tool against the API the first time you ask.
 
 ```
-              ┌──────────────────────────────────────────────┐
-              │  magicmarkets.com                            │
-              │                                              │
-  REST   ──▶  │  /v2/betslips/     quote a selection         │
-  REST   ──▶  │  /v2/orders/       place / close trades      │
-  REST   ──▶  │  /v2/heartbeats/   deadman's switch          │
-  REST   ──▶  │  /v2/balance/      balance & open stake      │
-  wss:// ──▶  │  /v2/stream        events, offers, fills     │
-              └──────────────────────────────────────────────┘
+              +----------------------------------------------+
+              |  magicmarkets.com                            |
+              |                                              |
+  REST   -->  |  /v2/events/       events with prices        |
+  REST   -->  |  /v2/offers/       stake at each price       |
+  REST   -->  |  /v2/betslips/     quote a selection         |
+  REST   -->  |  /v2/orders/       place / close trades      |
+  REST   -->  |  /v2/heartbeats/   deadman's switch          |
+  REST   -->  |  /v2/balance/      balance & open stake      |
+  wss:// -->  |  /v2/stream        live offers, quotes, fills|
+              +----------------------------------------------+
 ```
 
 ## What it enables
 
-- **Discover events**: the stream's initial sync is the discovery mechanism;
-  there is no REST endpoint that lists events.
-- **Stream live prices**: maintain a correct book from `offer`,
-  `remove_offer` and `clear_events`.
+- **Discover events**: `GET /v2/events/`, or the stream's initial sync.
+- **Read prices**: `GET /v2/offers/` for scripts and reports; the stream for
+  a live book built from `offer`, `remove_offer` and `clear_events`.
 - **Place orders**: back, lay or parlay, with idempotency via `request_uuid`.
-- **Run protected bots**: heartbeats that auto-close exposure if the bot dies.
-- **Handle failure properly**: in-band error codes, silent TCP closes,
-  reconnect-and-re-register, rate limits.
+- **Run protected bots**: heartbeats that close open orders if the bot dies.
+- **Handle failure properly**: handshake codes, in-band error codes, 1008
+  and silent closes, reconnect-and-re-register, rate limits.
+
+This skill is for the trading API. The read-only data feed at
+`data.magicmarkets.com` is a separate product with its own skill:
+[magicmarkets/magicmarkets-data-feed](https://github.com/magicmarkets/magicmarkets-data-feed).
 
 ## Source of truth
 
 MagicMarkets publishes complete, current documentation. This skill is a
 working guide over it, not a replacement: it tells Claude to fetch the real
-docs for exact schemas:
+docs for exact schemas.
 
 | URL | What |
 |-----|------|
-| [`/llms.txt`](https://magicmarkets.com/llms.txt) | Index |
-| [`/llms-full.txt`](https://magicmarkets.com/llms-full.txt) | Full reference (~109 KB Markdown) |
-| [`/v2/openapi.yaml`](https://magicmarkets.com/v2/openapi.yaml) | OpenAPI 3.1: 18 paths, 29 schemas |
+| [`/docs`](https://magicmarkets.com/docs) | Documentation site |
+| [`/llms.txt`](https://magicmarkets.com/llms.txt) | Index of the machine-readable docs |
+| [`/llms-full.txt`](https://magicmarkets.com/llms-full.txt) | Full API reference (about 150 KB of Markdown) |
+| [`/v2/openapi.yaml`](https://magicmarkets.com/v2/openapi.yaml) | OpenAPI 3.1: 20 paths |
 
 ## Install
 
-Clone into your Claude skills directory (the folder name must match the
-`name:` in `SKILL.md`, which is `magicmarkets-magic-api`):
+Clone into your Claude skills directory. The folder name must match the
+`name:` in `SKILL.md`, which is `magicmarkets-magic-api`:
 
 ```bash
 mkdir -p ~/.claude/skills
-git clone https://github.com/Magic-Markets-Public/magic-api.git \
+git clone https://github.com/magicmarkets/magic-api.git \
   ~/.claude/skills/magicmarkets-magic-api
 ```
 
 Auto-loads in **Claude Code** (`~/.claude/skills/` user-wide, or
 `.claude/skills/` per-project: no restart needed) and any host using the same
-layout. For **Claude Desktop**, drop the folder into the directory shown by
-Settings → Skills.
+layout. For **Claude Desktop**, add the folder in Settings, Skills.
+
+To update an existing install:
+
+```bash
+git -C ~/.claude/skills/magicmarkets-magic-api pull
+```
 
 ### Verify
 
@@ -61,7 +74,7 @@ Settings → Skills.
 ls ~/.claude/skills/magicmarkets-magic-api/SKILL.md
 
 # smoke-test your key (Settings -> API on magicmarkets.com)
-curl -H "X-Api-Key: $MAGIC_API_KEY" https://magicmarkets.com/v2/xrates/
+curl -H "X-Api-Key: $MAGIC_API_KEY" https://magicmarkets.com/v2/balance/
 ```
 
 Then ask Claude something like *"using the MagicMarkets API, what's tradeable
@@ -71,28 +84,25 @@ right now?"*
 
 ```
 SKILL.md                    concepts, flow, gotchas: what Claude reads first
+references/rest.md          REST endpoints, market data, schemas, errors, limits
 references/streaming.md     WebSocket protocol in full
-references/rest.md          REST endpoints, schemas, errors, limits
 references/recipes.md       task-shaped patterns
 examples/                   runnable Python (03 and 04 dry-run by default)
+tests/                      offline tests, plus read-only live tests (-m live)
+scripts/                    copy and link checks used by CI
 ```
 
-## Breaking changes in this revision
+## Development
 
-The previous version of this skill was written against infrastructure that has
-since been retired, and would not work:
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+make install        # pip install -r requirements-dev.txt
+make check          # ruff, offline tests, copy and link checks
+MAGIC_API_KEY=... make test-live   # read-only calls to the real API
+```
 
-| Previously documented | Actual |
-|---|---|
-| `pro.magicmarkets.com` | `magicmarkets.com` (the `pro.` host 301s) |
-| `wss://…/magic-cpricefeed/v2` | `wss://magicmarkets.com/v2/stream` (the old feed returns **502**) |
-| `["watch_event", [comp_id, sport, event_id]]` | `["register_event", sport, event_id]` |
-| `["offers_event", …]` messages | `["offer", …]` entries inside a `{"ts", "data"}` envelope |
-| `GET /web/offerhist/…` | Does not exist (404) |
-
-`references/pricefeed-reference.md` and `references/rest-reference.md` are now
-redirect stubs, as are `examples/01-find-and-bet.py` and
-`examples/05-arb-detector.py`.
+CI runs the offline tests on Python 3.10-3.14. It never calls the live API.
+See [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 ## Licence
 

@@ -1,0 +1,3 @@
+# Runtime dependencies of the examples. Install with: pip install -r examples/requirements.txt
+requests>=2.31,<3
+websockets>=13,<18

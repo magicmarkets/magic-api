@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
 """
-06 — Register many events on one socket and stream best-of-book.
+06: Register many events on one socket and stream best-of-book.
 
 Shows the multi-event patterns that matter:
-  * one socket, many registrations — never a socket per event
+  * one socket, many registrations: never a socket per event
   * the registered-event cap is counted across ALL your connections
-  * registrations do NOT survive a reconnect — re-register after any drop
+  * registrations do NOT survive a reconnect: re-register after any drop
   * reconnect with exponential backoff; a silent close looks like a clean EOF
+
+It watches the next matches that have not started, not outrights.
 
 Usage:
     export MAGIC_API_KEY=...
-    python examples/06-multi-stream.py               # up to 10 priced events
-    python examples/06-multi-stream.py fb 20         # 20 football events
+    python 06-multi-stream.py               # the next 10 priced matches
+    python 06-multi-stream.py fb 20         # the next 20 football matches
 """
 
 import sys
 import time
 
-from _common import (best, frames, label, open_stream, register, sync_events,
-                     verify_key)
+from _common import (
+    best,
+    frames,
+    label,
+    open_stream,
+    register,
+    run_cli,
+    sync_events,
+    upcoming_matches,
+    verify_key,
+)
 
 
 def main(sport_filter, limit):
@@ -29,8 +40,8 @@ def main(sport_filter, limit):
         try:
             run(sport_filter, limit)
             delay = 1
-        except KeyboardInterrupt:
-            return
+        except (KeyboardInterrupt, SystemExit, BrokenPipeError):
+            raise
         except Exception as exc:
             print(f"!! {type(exc).__name__}: {exc}")
         print(f"reconnecting in {delay}s")
@@ -40,17 +51,14 @@ def main(sport_filter, limit):
 
 def run(sport_filter, limit):
     with open_stream() as ws:
-        events = sync_events(ws)
-        if sport_filter:
-            events = [e for e in events if e.get("sport") == sport_filter]
-        events = events[:limit]
+        events = upcoming_matches(sync_events(ws), sport_filter)[:limit]
         if not events:
-            raise SystemExit("No priced events matched.")
+            raise SystemExit("No priced matches found.")
 
         names = {}
         for ev in events:
-            # Re-registering on every (re)connect is required — the server
-            # does not remember them across connections.
+            # Re-register on every (re)connect: the server does not remember
+            # registrations across connections.
             register(ws, ev["sport"], ev["event_id"])
             names[(ev["sport"], ev["event_id"])] = label(ev)
         print(f"registered {len(events)} event(s)\n")
@@ -63,13 +71,14 @@ def run(sport_filter, limit):
             elif tag == "remove_offer":
                 book.pop((p["sport"], p["event_id"], p["bet_type"]), None)
             elif tag == "clear_events":
-                print("!! upstream feed lost — clearing")
+                print("!! upstream feed lost: clearing")
                 book.clear()
             elif tag == "response" and p and p.get("status") == "error":
                 code = p.get("code")
                 if code == "customer_event_limit_exceeded":
-                    raise SystemExit("registered-event cap hit (counted across "
-                                     "all your connections) — unregister first")
+                    raise SystemExit(
+                        "registered-event cap hit (counted across all your connections): unregister first"
+                    )
                 print(f"!! stream error: {code}")
 
         # frames() returning means the socket closed, possibly silently.
@@ -86,5 +95,8 @@ def show(names, offer):
 
 if __name__ == "__main__":
     positional = [a for a in sys.argv[1:] if not a.startswith("--")]
-    main(sport_filter=positional[0] if positional else None,
-         limit=int(positional[1]) if len(positional) > 1 else 10)
+    run_cli(
+        main,
+        sport_filter=positional[0] if positional else None,
+        limit=int(positional[1]) if len(positional) > 1 else 10,
+    )

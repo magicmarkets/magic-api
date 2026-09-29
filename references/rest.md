@@ -10,9 +10,70 @@ Base: `https://magicmarkets.com/v2/` · Auth: `X-Api-Key: <key>` on every reques
 All responses share one envelope: check `status` before reading `data`:
 
 ```json
-{"status": "ok", "data": …}
+{"status": "ok", "data": ...}
 {"status": "error", "code": "<code>", "data": <details>}
 ```
+
+List query parameters repeat: `?sport=fb&sport=tennis`.
+
+---
+
+## Market data
+
+Both endpoints return the same objects the stream sends, so code that reads
+one can read the other. For live prices, use the stream.
+
+### `GET /v2/events/`: events with prices
+
+| Parameter | Notes |
+|---|---|
+| `sport` | List. Needed with `event_id` or `competition_id` |
+| `competition_id` | List of integers |
+| `event_id` | List. The form an event carries, such as `2026-06-15,1001,2002`; other forms get a 400 |
+| `ir_status` | `pre_event` or `in_running` |
+| `start_time_from`, `start_time_to` | ISO 8601 times |
+| `lang` | `en` (default), `zh-hans`, `ko` |
+| `limit` | Default 500, at most 5000 |
+| `after` | `"{sport},{event_id}"` of the last entry on the previous page |
+
+A page shorter than `limit` is the last. There is no total count. A filter
+that matches nothing returns an empty `data`.
+
+`event_type` gives the shape: `normal` has `home` and `away`; `multirunner`
+has `teams` and `end_time`. Every entry has its `sport`, so a follow-up call
+can always supply it.
+
+Check `start_time` as well as `ir_status`. An event can still show
+`pre_event` after its start time.
+
+### `GET /v2/offers/`: stake at each price
+
+| Parameter | Notes |
+|---|---|
+| `sport` | Required, one value |
+| `event_id` | Required. Up to 20 events in one request |
+| `bet_type` | List. The same strings `POST /v2/betslips/` takes |
+| `market_type` | List of families, such as `ah`, `ou`, `wdw` |
+| `min_liquidity` | Keep a market when its `max` stakes add up to at least this many USDT |
+| `limit` | Default 500, at most 5000 |
+| `after` | `"{event_id},{bet_type}"` of the last entry on the previous page |
+
+- Offers come back in `event_id` order, then `bet_type` order.
+- Markets with no stake are left out. `for` and `against` on one selection
+  are two markets.
+- An event with no prices, or one the feed does not know, returns no offers.
+  The other events in the request still come back.
+- For a sport your account is not enabled for, the list is empty.
+- The reply can be about 4 seconds behind the stream
+  (`Cache-Control: private, max-age=2`). Each page is read when it is
+  requested, so pages of one event can differ in time.
+- **Only 4 requests can be open at once** for each account. A call that names
+  20 events costs the same as one that names 1. A request over the cap gets
+  `429 throttled` with `retry_after: 1`.
+
+Errors specific to market data: `403 invalid_customer` (the feed has no
+record of your account; contact support) and `503 warming` (the feed is
+loading; retry with backoff).
 
 ---
 
@@ -27,7 +88,7 @@ instead.
 {
   "sport": "fb",
   "event_id": "2026-06-15,1001,2002",
-  "bet_type": "for,ah,h,1",
+  "bet_type": "for,ah,h,-4",
   "betslip_type": "normal"
 }
 ```
@@ -35,8 +96,9 @@ instead.
 | Field | Notes |
 |---|---|
 | `sport`, `event_id`, `bet_type` | Required for `normal` / `lay`. Copy verbatim off an offer |
-| `legs[]` | For parlays: `[{sport, event_id, bet_type}, …]` |
+| `legs[]` | For parlays: `[{sport, event_id, bet_type, live_score?}, ...]` |
 | `betslip_type` | `normal` (default), `lay`, `parlay` |
+| `live_score` | In-play: `{"home": 1, "away": 0}`. Liquidity quoted at a different score is then never treated as equal to your selection |
 | `equivalent_bets` | Default `true` |
 | `exclude_danger` | Only use liquidity sources with no bets in danger status |
 | `user_data` | Free-form string echoed back |
@@ -46,12 +108,13 @@ Returns **201** with `betslip_id`, `bet_type_description`, `expiry_ts`,
 
 **The create response carries no prices.** Quotes are gathered
 asynchronously. Either:
-- read them off the WebSocket as `["pmm", …]` entries matching your
+- read them off the WebSocket as `["pmm", ...]` entries matching your
   `betslip_id` (preferred: you should already hold the socket open), or
 - poll `GET /v2/betslips/{betslip_id}/` until `price_list` populates.
 
 Typically a couple of seconds. Watch `expiry_ts`: betslips are short-lived.
 An empty `price_list` that stays empty means no liquidity; pick another offer.
+Each account can create 2000 betslips a day.
 
 On parlays, `sport` comes back as the literal `parlay` and `event_id` as `""`.
 
@@ -73,14 +136,14 @@ On parlays, `sport` comes back as the literal `parlay` and `event_id` as `""`.
   "price": 2.0,
   "stake": ["USDT", 10.0],
   "duration": 5.0,
-  "request_uuid": "…"
+  "request_uuid": "..."
 }
 ```
 
 | Field | Notes |
 |---|---|
 | `betslip_id` | Required |
-| `price` | Decimal. Off-tick snaps **down** for `for`, **up** for `against` |
+| `price` | Limit decimal price. Off-tick moves **up** for `for`, **down** for `against` (see below) |
 | `stake` | `["USDT", amount]` |
 | `duration` | Order lifetime in **seconds**, default 15 |
 | `request_uuid` | Idempotency key: **always send one** from automated code |
@@ -89,9 +152,11 @@ On parlays, `sport` comes back as the literal `parlay` and `event_id` as `""`.
 | `accept_partial_fill` | Default `true` |
 | `accept_better_price` | Default `true` |
 | `force_want_price` | Force the requested price |
-| `min_taker_want_stake` | Stake tuple or `null`. Pair with `dark` to stop small probe orders discovering your price |
+| `min_taker_want_stake` | `dark` only. Stake tuple or `null`: the smallest order that can match yours |
 | `current_score` | `[home, away]` score assertion. See below |
 | `exclude_danger` | As per betslips |
+| `bookie_min_stakes` | Optional per-source minimum stakes, `{source: [currency, amount]}` |
+| `user_data`, `placer_type` | Optional tags recorded against the order |
 
 #### `exchange_mode`
 
@@ -104,8 +169,8 @@ The difference is what happens to the unfilled remainder:
 - `dark`: advertises the remainder invisibly. Other orders can match it when
   their price crosses yours, but they cannot see your price.
 
-The values `make` and `take` do not exist. They were a documentation error in
-old copies of the spec, and the API rejects them with `validation_error`.
+The values `make` and `take` do not exist. The API rejects them with
+`validation_error`.
 
 #### `current_score`
 
@@ -119,19 +184,28 @@ The check is only meaningful for football-style scores. For other sports,
 and while no score is known yet, the server assumes `[0, 0]` and rejects any
 other value. Omit the field outside football.
 
+### Order lifecycle
+
 Returns **201** with `order_id` and `status: "open"`. `price`, `stake` and
 `profit_loss` are `null` until the order fills.
 
-Lifecycle: `open → pending → done | failed`. Watch `["order", …]` and
-`["bet", …]` on the WebSocket, or `GET /v2/orders/{order_id}/`.
+Statuses: `open`, `pending`, `done`, `failed`, `partial_void`, `full_void`,
+`reconciled`. The usual path is `open -> pending -> done | failed`. Watch
+`["order", ...]` and `["bet", ...]` on the WebSocket, or
+`GET /v2/orders/{order_id}/`.
 
 **`done` means filled, not settled.** The final `profit_loss` lands after the
-event finishes.
+event finishes. `failed` usually means a limit order that expired without a
+match; read `close_reason`.
+
+`order_type` is `normal`, `lay` or `parlay` for orders placed through the
+API. `brokerage`, `cashout` and `custom` can appear on orders from other
+channels. Treat it as an open set.
 
 ### Idempotency
 
 Reusing a `request_uuid` returns `409 order_already_created` with the existing
-`order_id` in `data`: so retrying after a timeout is safe and cannot
+`order_id` in `data`, so retrying after a timeout is safe and cannot
 double-place. `GET /v2/orders/tracked/{uuid}/` looks an order up by
 `request_uuid` for up to **6 hours** after placement; after that it is `404`.
 
@@ -139,23 +213,27 @@ double-place. `GET /v2/orders/tracked/{uuid}/` looks an order up by
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v2/orders/` | List orders |
+| `GET /v2/orders/` | List orders. **Paged**: `page`, `page_size` (default 25). Filters: `status`, `sport`, `event_id`, `order_type`, `date_from`, `date_to`, `search` |
 | `GET /v2/orders/{order_id}/` | Fetch one |
 | `GET /v2/orders/updates/` | Changes since a timestamp: requires `updated_at_from` |
 | `GET /v2/orders/tracked/{uuid}/` | Look up by `request_uuid` (6 h window) |
 | `POST /v2/orders/{order_id}/close/` | Close one. `400 order_closed` if already closed |
-| `POST /v2/orders/close_many/` | Close a specified set |
+| `POST /v2/orders/close_many/` | Close a named set: `{"order_ids": [...]}` |
 | `POST /v2/orders/close_all/` | Close everything open |
 | `GET /v2/orders/position/` | Current position; requires filter params |
 
-`close_all` is unfiltered and irreversible: confirm intent before calling it.
+A page past the last one returns an empty list. Read every page before you
+conclude that an order is not there.
+
+`close_all` is unfiltered and cannot be undone: confirm intent before calling it.
 
 ---
 
 ## Account
 
-- `GET /v2/balance/`: balance and open stake. Also the **cheapest key
-  check**; call it before opening the WebSocket.
+- `GET /v2/balance/`: `balance`, `open_stake` and, when the account has it,
+  `smart_credit` (extra funds equal to what open bets are expected to win).
+  Also the **cheapest key check**; call it before opening the WebSocket.
 - `GET /v2/xrates/`: exchange rates.
 
 ---
@@ -178,7 +256,7 @@ around any unattended strategy.
 | `DELETE /v2/heartbeats/{heartbeat_id}/` | Cancel |
 
 `timeout` must be **10-300 seconds**; outside that range returns `400`.
-Create returns `heartbeat_id` and `expiry_time`.
+Create returns **200** with `heartbeat_id` and `expiry_time`.
 
 Two behaviours to build risk handling around:
 
@@ -193,8 +271,11 @@ races the expiry will not save the orders.
 
 ## Reference data
 
-`GET /v2/sports/{sport}/bet_types/{bet_type}/`: validate and describe a bet
-type. Use this instead of parsing or constructing `bet_type` strings yourself.
+`GET /v2/sports/{sport}/bet_types/{bet_type}/`: check and describe a bet
+type. A 200 has a readable `bet_type_description` and the payoff grid; a
+`400 invalid_bet_type` means the string did not parse. It cannot check
+outright bet types (`for,win,...`, `for,top,...`), which always return 400.
+Use it instead of parsing or constructing `bet_type` strings yourself.
 
 ---
 
@@ -202,15 +283,17 @@ type. Use this instead of parsing or constructing `bet_type` strings yourself.
 
 | HTTP | `code` | Meaning |
 |------|--------|---------|
-| 400 | `validation_error` | `data.validation_errors` is `{field: [reason]}`; cross-field in `non_field_errors` |
+| 400 | `validation_error` | `data.validation_errors` is `{field: [reason]}`; cross-field in `non_field_errors`; a rejected list field is index-keyed: `{field: {"0": [reason]}}` |
 | 400 | `order_closed` | Order exists but already closed/settled (distinct from `not_found`) |
-| 401 | `auth_error` | Key missing, malformed, or rejected |
+| 401 | `auth_error` | Key missing, malformed, or rejected. The detail text is the same for a missing and a wrong key |
 | 403 | `forbidden` | Valid key, action not permitted |
+| 403 | `invalid_customer` | Market data: the feed has no record of your account. A retry gets the same answer |
 | 404 | `not_found` | Unknown resource, or not visible to this key |
 | 409 | `order_already_created` | `request_uuid` reused; `data` has the existing `order_id` |
 | 409 | `limit_reached` | Per-customer cap; `data.detail` describes it |
 | 429 | `throttled` | `data.retry_after` seconds, plus a `Retry-After` header |
 | 500 | `server_error` | `data` is `["An error has occurred, token:", "<token>"]`: quote the token to support |
+| 503 | `warming` | Market data is loading. Retry with backoff |
 | 503 | *(no envelope)* | Upstream unreachable; body is `{"detail": "Service unavailable"}` |
 
 Branch on `code`, not on the HTTP status alone. For `validation_error`, branch
@@ -220,17 +303,25 @@ on the keys of `data.validation_errors`.
 
 ## Rate limits
 
-Per **account**: all keys share one budget, sliding window.
+Per **account**: all keys share one budget. Each limit is a token bucket that
+refills continuously, so an idle account can spend a full bucket at once.
 
 | Applies to | Limit |
 |---|---|
 | All endpoints | 100 req/s burst, 1200 req/min sustained |
-| `POST /v2/betslips/` | 10 req/s |
+| `POST /v2/betslips/` | 10 req/s, and 2000 betslips a day |
 | `POST /v2/orders/` | 5 req/s |
+| `GET /v2/offers/` | 4 requests open at once |
 
-Placement limits are dedicated budgets, not drawn from the general one. No
-daily caps, no per-IP limit. Success responses carry **no** remaining-quota
-header: track your own rate. Limits can be raised per account via support.
+The betslip and order limits are their own budgets: a busy market-data
+poller never throttles placement. Every other endpoint, market data
+included, shares the general budget. Budgets are keyed on the account, not
+the address, so several hosts do not multiply them. Success responses carry
+**no** remaining-quota header: track your own rate. Limits can be raised per
+account through support.
+
+The stream at `/v2/stream` has no message-rate limit. See
+[`streaming.md`](streaming.md) for its connection limits.
 
 ---
 
@@ -238,7 +329,7 @@ header: track your own rate. Limits can be raised per account via support.
 
 Stakes are `[currency, amount]` tuples and responses are always **USDT**.
 
-Prices lie on a fixed tick schedule:
+Single-market prices lie on a fixed tick schedule:
 
 | Decimal price | Tick |
 |---|---|
@@ -253,7 +344,14 @@ Prices lie on a fixed tick schedule:
 | 50 - 100 | 5 |
 | 100 - 1000 | 10 |
 
-Band boundaries are exact in decimal price. Feed prices are always already
-on-tick; a submitted price is snapped to the nearest tick that does not
-tighten your limit (down for `for`, up for `against`), and the snapped price
-is what the order runs with.
+Band boundaries are exact in decimal price. Feed prices are always on tick.
+An order price is a limit: a bet is taken only at that price or better
+(higher for `for`, lower for `against`). An off-tick limit moves to the
+first tick that honours it: **up** for `for` and **down** for `against`. A
+back limit of 7.15 becomes 7.20 and is not filled at 7.00. The moved price is
+the one the order runs with and the one the response reports.
+`snap_limit()` in [`../examples/_common.py`](../examples/_common.py) does
+the same calculation.
+
+Parlay prices are the product of the legs' prices, so they are on no tick
+schedule. They are quoted and accepted at full precision, up to 1000.
